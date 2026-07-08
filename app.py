@@ -23,8 +23,27 @@ from pipeline.assembler import PDFAssembler
 
 load_dotenv()
 
-FONT_REGULAR = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-FONT_BOLD    = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+def _find_font(*candidates: str) -> str:
+    for path in candidates:
+        if Path(path).exists():
+            return path
+    raise FileNotFoundError(
+        f"Could not find a font. Set FONT_REGULAR / FONT_BOLD in .env, "
+        f"or install the DejaVu fonts. Tried: {candidates}"
+    )
+
+FONT_REGULAR = os.environ.get("FONT_REGULAR") or _find_font(
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",          # Linux (Debian/Ubuntu)
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",                   # Linux (Fedora/Arch)
+    "/Library/Fonts/Arial.ttf",                                 # macOS
+    "C:/Windows/Fonts/arial.ttf",                               # Windows
+)
+FONT_BOLD = os.environ.get("FONT_BOLD") or _find_font(
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    "/Library/Fonts/Arial Bold.ttf",
+    "C:/Windows/Fonts/arialbd.ttf",
+)
 
 UPLOAD_DIR = Path("uploads")
 OUTPUT_DIR = Path("outputs/web")

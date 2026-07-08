@@ -1,0 +1,10 @@
+flask>=3.1
+gunicorn>=21.0
+python-dotenv>=1.0
+pillow>=10.0
+paddlepaddle>=2.6
+paddleocr>=2.7
+openai>=1.0
+pymupdf>=1.23
+opencv-python-headless>=4.8
+numpy>=1.24
