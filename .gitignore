@@ -1,3 +1,37 @@
-.venv
+# Environment
 .env
-__pycache__
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Runtime directories (generated files)
+uploads/
+outputs/
+
+# PaddleOCR model cache
+inference/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
