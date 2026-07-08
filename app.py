@@ -145,6 +145,11 @@ def run_translation(job_id: str, input_path: str, target_language: str, dpi: int
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/")
+def landing():
+    return render_template("landing.html")
+
+
+@app.route("/app")
 def index():
     if not session.get("authenticated"):
         return redirect(url_for("login"))
@@ -157,7 +162,7 @@ def login():
     if request.method == "POST":
         if request.form.get("password") == APP_PASSWORD:
             session["authenticated"] = True
-            return redirect(url_for("index"))
+            return redirect(url_for("index"))   # /app
         error = "Incorrect password. Please try again."
     return render_template("login.html", error=error)
 
