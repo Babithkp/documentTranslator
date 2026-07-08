@@ -4,6 +4,7 @@ let selectedDpi  = 150;
 let currentJobId = null;
 let evtSource    = null;
 
+
 /* ── Step map: SSE step names → DOM IDs ────────────────────────────────────── */
 const STEP_ORDER = ['render', 'ocr', 'translate', 'draw', 'assemble'];
 const STEP_MAP   = {
@@ -206,7 +207,6 @@ function resetUI() {
   setProgress(0, 'Initialising pipeline…');
   resetSteps();
   document.getElementById('page-info').textContent = '';
-
   showSection('upload');
 }
 

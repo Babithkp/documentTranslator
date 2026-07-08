@@ -1,6 +1,7 @@
 import json
 import os
 import queue
+import shutil
 import threading
 import uuid
 from pathlib import Path
@@ -199,6 +200,13 @@ def translate():
     input_path = str(UPLOAD_DIR / job_id / f"input{ext}")
     file.save(input_path)
 
+    # Clean up all previous uploads and outputs before starting a new job
+    for old_dir in UPLOAD_DIR.iterdir():
+        if old_dir.is_dir() and old_dir.name != job_id:
+            shutil.rmtree(old_dir, ignore_errors=True)
+    for old_pdf in OUTPUT_DIR.glob("*.pdf"):
+        old_pdf.unlink(missing_ok=True)
+
     job_queues[job_id] = queue.Queue()
     threading.Thread(
         target=run_translation,
@@ -233,6 +241,7 @@ def progress(job_id):
         mimetype="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
 
 
 @app.route("/download/<job_id>")
