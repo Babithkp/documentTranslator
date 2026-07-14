@@ -31,28 +31,162 @@ def build_lines(words: list) -> list:
         return []
 
     raw_lines = _group_into_lines(words)
-    result = []
 
+    # Each visual line becomes a list of segment entries.  A line split into
+    # more than one segment is columnar (a table row); a single-segment line is
+    # a candidate paragraph line.
+    line_segments = []
     for raw in raw_lines:
-        merged = _merge_line(raw)
-        text_words = [w for w in merged["words"] if is_text_word(w["text"])]
+        segs = []
+        for segment in _split_line_into_segments(raw):
+            merged = _merge_line(segment)
+            text_words = [w for w in merged["words"] if is_text_word(w["text"])]
+            if not text_words:
+                continue
+            segs.append({
+                "text": " ".join(w["text"] for w in text_words),
+                "text_bbox": _bbox_of(text_words, key=lambda w: tuple(w["bbox"])),
+                "char_height": statistics.mean(
+                    w["bbox"][3] - w["bbox"][1] for w in text_words
+                ),
+                "full_text": merged["text"],
+            })
+        if segs:
+            line_segments.append(segs)
 
-        if not text_words:
+    # The true content right edge includes numbers/codes (not just text), so a
+    # short table cell is never mistaken for a full-width prose line.
+    page_right = max(w["x2"] for w in words)
+    return _assemble_paragraphs(line_segments, page_right)
+
+
+# ── Paragraph grouping ─────────────────────────────────────────────────────────
+#
+# Flowing prose must be translated and re-wrapped as a whole block, not line by
+# line: a per-line translation runs longer than its source line and would be
+# shrunk to fit, giving the wildly uneven font sizes seen on letters/essays.
+# Table rows must NOT be merged this way or the columns collapse.
+#
+# The two are told apart by the right margin: a wrapped-prose line runs to the
+# content right edge ("full width"); a table cell / short label does not.  A
+# full-width line is therefore never the *last* line of a paragraph, so a
+# paragraph keeps going as long as its current line is full width and the next
+# line follows at normal leading.  It ends at the first short line.
+#
+# Gaps are kept tight: a dropped noise line leaves a ~1.4× gap that is
+# indistinguishable from a real paragraph break, so we do NOT bridge it — the
+# orphaned line is instead reflowed on its own (see the lone-full-width branch),
+# which avoids both merging separate paragraphs and shrinking the orphan tiny.
+
+_PARA_FILL_RATIO = 0.80    # a line reaching this fraction of the width is "full"
+_PARA_GAP_RATIO = 0.8      # max vertical gap (× line height) within a paragraph
+
+
+def _assemble_paragraphs(line_segments: list, page_right: float) -> list:
+    """Merge consecutive prose lines into reflowable paragraph blocks."""
+    line_segments.sort(key=lambda segs: min(s["text_bbox"][1] for s in segs))
+
+    result = []
+    i, n = 0, len(line_segments)
+    while i < n:
+        # Columnar lines (multiple segments) are never merged into paragraphs.
+        if len(line_segments[i]) != 1:
+            result.extend(line_segments[i])
+            i += 1
             continue
 
-        t_bbox = _bbox_of(text_words, key=lambda w: tuple(w["bbox"]))
-        t_height = statistics.mean(
-            w["bbox"][3] - w["bbox"][1] for w in text_words
-        )
+        # Grow the paragraph while its last line is full width (i.e. not a
+        # paragraph-ending short line) and the next line is left-aligned/near.
+        para = [line_segments[i][0]]
+        j = i + 1
+        while j < n and len(line_segments[j]) == 1:
+            prev, cur = para[-1], line_segments[j][0]
+            if not _is_full_width(prev, page_right):
+                break
+            ph = prev["char_height"] or 1
+            gap = cur["text_bbox"][1] - prev["text_bbox"][3]
+            left_aligned = abs(cur["text_bbox"][0] - prev["text_bbox"][0]) <= ph * 1.5
+            if gap <= ph * _PARA_GAP_RATIO and left_aligned:
+                para.append(cur)
+                j += 1
+            else:
+                break
 
-        result.append({
-            "text": " ".join(w["text"] for w in text_words),
-            "text_bbox": t_bbox,
-            "char_height": t_height,
-            "full_text": merged["text"],
-        })
+        # A multi-line run, or a lone full-width line, is reflowed (re-wrapped
+        # at a uniform size) instead of shrunk.  A lone short line (label,
+        # heading, table cell) is left as an ordinary single line.
+        if len(para) >= 2 or _is_full_width(para[0], page_right):
+            result.append(_make_paragraph(para))
+        else:
+            result.append(para[0])
+        i += len(para) if len(para) >= 2 else 1
 
     return result
+
+
+def _is_full_width(line: dict, page_right: float) -> bool:
+    """True when the line runs to the content right edge (wrapped prose), as
+    opposed to a short ragged table cell / label."""
+    x1, x2 = line["text_bbox"][0], line["text_bbox"][2]
+    avail = page_right - x1
+    return avail > 0 and (x2 - x1) >= _PARA_FILL_RATIO * avail
+
+
+def _make_paragraph(para: list) -> dict:
+    """Collapse a run of prose lines (or one full-width line) into a reflow entry."""
+    x1 = min(p["text_bbox"][0] for p in para)
+    y1 = min(p["text_bbox"][1] for p in para)
+    x2 = max(p["text_bbox"][2] for p in para)
+    y2 = max(p["text_bbox"][3] for p in para)
+    # Original line pitch keeps the reflowed lines at the source line spacing.
+    pitch = (y2 - y1) / (len(para) - 1) if len(para) > 1 else para[0]["char_height"] * 1.3
+    return {
+        "text": " ".join(p["text"] for p in para),
+        "text_bbox": [x1, y1, x2, y2],
+        "char_height": statistics.median([p["char_height"] for p in para]),
+        "full_text": " ".join(p["full_text"] for p in para),
+        "reflow": True,
+        "line_pitch": pitch,
+    }
+
+
+# A single inter-word space is a small fraction of the font size (~0.2–0.3 em,
+# and at most ~0.6× the text height even in loosely-set or justified text).  A
+# gap wider than this many text-heights therefore cannot be an ordinary space —
+# it is a deliberate column / field separation.  The threshold is expressed in
+# text-heights so it scales with any font size, DPI, language, or document; it
+# is not tied to any particular layout.
+_COLUMN_GAP_RATIO = 1.5
+
+
+def _split_line_into_segments(words: list) -> list:
+    """
+    Split a line into segments wherever the gap between neighbouring words is
+    too wide to be a normal space (see _COLUMN_GAP_RATIO).
+
+    OCR groups a whole logical line together even when its parts are spread
+    across the page.  Joining those parts with single spaces and drawing from
+    the left throws the layout away.  Splitting at the wide gaps keeps each
+    field/column as its own segment, redrawn at its original x-position — the
+    horizontal spacing is taken from the source geometry, never invented.
+    """
+    if len(words) <= 1:
+        return [words]
+
+    sorted_words = sorted(words, key=lambda w: w["x1"])
+    heights = [w["y2"] - w["y1"] for w in sorted_words]
+    median_h = statistics.median(heights) if heights else 12
+    threshold = median_h * _COLUMN_GAP_RATIO
+
+    groups, current = [], [sorted_words[0]]
+    for word in sorted_words[1:]:
+        if word["x1"] - current[-1]["x2"] > threshold:
+            groups.append(current)
+            current = [word]
+        else:
+            current.append(word)
+    groups.append(current)
+    return groups
 
 
 def build_layout(words: list, dpi: int = 150) -> list:

@@ -11,15 +11,35 @@ Per-line:
      font size only when wrapped text is too tall for the bbox.
 """
 
+import bisect
 import statistics
+import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 _MIMG = Image.new("RGB", (1, 1))
 _MDRAW = ImageDraw.Draw(_MIMG)
 
-# Ink-density threshold above which we treat text as bold.
-_BOLD_THRESHOLD = 0.25
+# Bold test: stroke width as a fraction of text height (scale-invariant).
+# Stroke width is estimated from the distance transform of the ink.  Dividing
+# by the line height makes the measure independent of scan resolution / font
+# size, unlike raw ink density (which spikes on tightly-cropped tokens) or a
+# fixed-pixel erosion (which reads every stroke as thick at high DPI).  The
+# threshold sits just below genuine bold (headings/labels measure ~0.10-0.13
+# stroke-width/height on these scans) and above regular body text (≤ ~0.08), so
+# real bold is caught without body text or isolated codes going false-bold.
+_BOLD_THRESHOLD = 0.10
+
+# Translations (esp. German/Dutch) run longer than the English source.  Allow a
+# line to use this much more than the original text width before it is wrapped
+# or shrunk, so a slightly longer translation keeps the same font size as its
+# neighbours instead of dropping a step and looking uneven.
+_WIDTH_TOLERANCE = 1.25
+
+# OCR bboxes are a little taller than the actual ink (ascender-to-descender plus
+# padding).  Rendering at this fraction of the bbox height matches the original
+# visual size closely without spilling into neighbouring lines.
+_INK_HEIGHT_FACTOR = 0.90
 
 
 class TextRenderer:
@@ -32,6 +52,7 @@ class TextRenderer:
         image: Image.Image,
         lines: list,
         bg_color: tuple,
+        extra_erase_boxes: list = None,
     ) -> Image.Image:
         """
         Draw each translated line over the original image in place.
@@ -40,21 +61,51 @@ class TextRenderer:
           - translated   : translated string
           - text_bbox    : [x1, y1, x2, y2] of the original text words
           - char_height  : average pixel height of original text words
+
+        `extra_erase_boxes` are regions of leftover English that OCR missed
+        (see BackgroundEraser.find_missed_text_boxes).  Their ink is removed too,
+        but only when they do not sit inside a stamp, seal, or graphic.
+
+        Erasing is done by inpainting: only the dark ink pixels are masked, and
+        cv2 propagates the surrounding paper/watermark texture into them.  This
+        removes the text without leaving the flat rectangle a solid fill would,
+        so security watermarks and tinted backgrounds are preserved.
         """
         orig_arr = np.array(image.convert("RGB"))
         result   = image.copy().convert("RGB")
-        draw     = ImageDraw.Draw(result)
         img_w, img_h = result.size
 
         bg_brightness = sum(bg_color) / 3
         global_bg = bg_color
 
+        # Ink pixels to remove across the whole page (one inpaint pass at the end).
+        ink_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+
+        # ── Mask leftover text OCR could not read ────────────────────────────
+        for box in (extra_erase_boxes or []):
+            x1, y1, x2, y2 = map(int, box)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            if _is_over_graphic(orig_arr, x1, y1, x2, y2, img_h, img_w):
+                continue
+            _mask_ink(ink_mask, orig_arr, x1, y1, x2, y2)
+
         # ── Normalise char_heights across the page ────────────────────────
         valid_lines = [l for l in lines if l.get("text_bbox")]
         raw_heights = [l["char_height"] for l in valid_lines]
-        norm_heights = _cluster_heights(raw_heights)
+        norm_texts  = [l.get("text", "") for l in valid_lines]
+        norm_heights = _cluster_heights(raw_heights, norm_texts)
         height_map = {id(l): h for l, h in zip(valid_lines, norm_heights)}
 
+        # Vertical slot for each entry = distance down to the next block below.
+        # A reflowed paragraph runs longer than its English source, so it is
+        # fitted into this slot to avoid overlapping the following block.
+        entry_tops = sorted(
+            int(l["text_bbox"][1]) for l in lines if l.get("text_bbox")
+        )
+
+        # First pass: mask original ink and record where to draw each translation.
+        draw_jobs = []
         for line in lines:
             text = line.get("translated", "").strip()
             if not text or not line.get("text_bbox"):
@@ -67,23 +118,10 @@ class TextRenderer:
             text_color = _sample_text_color(orig_arr, x1, y1, x2, y2)
             bold = _is_bold(orig_arr, x1, y1, x2, y2, bg_brightness)
 
-            # ── Fit text: wrap within bbox width, scale down if too tall ──
-            # PaddleOCR bboxes include ~20 % vertical padding beyond actual ink.
-            # Scaling down to 0.80 of the bbox height matches the original visual size.
-            target_px = max(6, int(char_height * 0.80))
+            target_px = max(6, int(char_height * _INK_HEIGHT_FACTOR))
             font_path = self.font_bold if bold else self.font_regular
             bbox_w = max(1, x2 - x1)
             bbox_h = max(1, y2 - y1)
-            font, wrapped = _fit_text(text, target_px, bbox_w, bbox_h, font_path)
-
-            # ── Measure full rendered block ────────────────────────────────
-            line_h   = _line_height(font)
-            gap      = max(1, int(line_h * 0.15))
-            block_h  = len(wrapped) * line_h + (len(wrapped) - 1) * gap
-            block_w  = max(
-                (_MDRAW.textbbox((0, 0), l, font=font)[2] for l in wrapped),
-                default=bbox_w,
-            )
 
             # ── Skip text that sits over a stamp, seal, or graphic ───────
             # If the pixels directly above/below the bbox are dark the text
@@ -92,24 +130,94 @@ class TextRenderer:
             if _is_over_graphic(orig_arr, x1, y1, x2, y2, img_h, img_w):
                 continue
 
-            # ── Erase original: solid fill with local background colour ───
-            local_bg = _sample_local_bg(orig_arr, x1, y1, x2, y2, img_h, img_w) or global_bg
-            erase_x2 = min(x1 + max(block_w, bbox_w), img_w - 1)
-            erase_y2 = min(y1 + max(block_h, bbox_h), img_h - 1)
+            # ── Mask original ink pixels for inpainting ──────────────────
+            _mask_ink(ink_mask, orig_arr, x1, y1, x2, y2)
 
-            if erase_x2 > x1 and erase_y2 > y1:
-                draw.rectangle([x1, y1, erase_x2, erase_y2], fill=local_bg)
+            if line.get("reflow"):
+                # Paragraph: re-wrap the whole block within its own width at a
+                # uniform size, shrinking only if the (longer) translation would
+                # run past the next block below.
+                nxt = bisect.bisect_right(entry_tops, y1)
+                slot_bottom = entry_tops[nxt] if nxt < len(entry_tops) else img_h
+                avail_h = max(bbox_h, slot_bottom - y1 - 2)
+                font, wrapped, pitch = _fit_paragraph(
+                    text, target_px, bbox_w, avail_h, font_path
+                )
+                draw_jobs.append({
+                    "x": x1, "y": y1, "wrapped": wrapped, "font": font,
+                    "color": text_color, "pitch": pitch, "center_h": None,
+                })
+                continue
 
-            # ── Draw wrapped lines top-to-bottom ─────────────────────────
-            y_cursor = y1
-            for wline in wrapped:
-                draw.text((x1, y_cursor), wline, font=font, fill=text_color)
-                y_cursor += line_h + gap
+            # ── Fit line: wrap within bbox width (bounded tolerance), scale
+            #    down only if too tall.  Tolerance keeps row sizes even. ──
+            fit_w = min(int(bbox_w * _WIDTH_TOLERANCE), img_w - x1 - 2)
+            fit_w = max(fit_w, bbox_w)
+            font, wrapped = _fit_text(text, target_px, fit_w, bbox_h, font_path)
+            line_h = _line_height(font)
+            gap    = max(1, int(line_h * 0.15))
+            block_h = len(wrapped) * line_h + (len(wrapped) - 1) * gap
+            draw_jobs.append({
+                "x": x1, "y": y1, "wrapped": wrapped, "font": font,
+                "color": text_color, "pitch": line_h + gap, "center_h": (bbox_h, block_h),
+            })
+
+        # ── Inpaint the masked ink, preserving watermark/texture ─────────────
+        if ink_mask.any():
+            # Grow the mask so faint stroke halos are covered.  A wider halo is
+            # safe: inpaint rebuilds the watermark from the untouched neighbours.
+            ink_mask = cv2.dilate(ink_mask, np.ones((5, 5), np.uint8), iterations=1)
+            bgr = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
+            bgr = cv2.inpaint(bgr, ink_mask, 3, cv2.INPAINT_TELEA)
+            result = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+
+        # ── Second pass: draw translations on the cleaned page ───────────────
+        draw = ImageDraw.Draw(result)
+        for job in draw_jobs:
+            y_cursor = job["y"]
+            # A single line is vertically centred on the row it replaces; a
+            # paragraph starts at its top and flows down at the source pitch.
+            if job["center_h"]:
+                bbox_h, block_h = job["center_h"]
+                y_cursor += max(0, (bbox_h - block_h) // 2)
+            for wline in job["wrapped"]:
+                draw.text((job["x"], y_cursor), wline, font=job["font"], fill=job["color"])
+                y_cursor += job["pitch"]
 
         return result
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
+
+def _mask_ink(
+    mask: np.ndarray, arr: np.ndarray, x1: int, y1: int, x2: int, y2: int
+) -> None:
+    """
+    Mark the dark ink pixels inside the bbox for inpainting.
+
+    Only pixels clearly darker than the local paper are masked; the lighter
+    watermark/tint pixels are left untouched so cv2.inpaint can rebuild the
+    background texture from them instead of painting a flat patch.
+    """
+    x1 = max(0, x1); y1 = max(0, y1)
+    x2 = min(arr.shape[1], x2); y2 = min(arr.shape[0], y2)
+    if x2 <= x1 or y2 <= y1:
+        return
+
+    region = arr[y1:y2, x1:x2]
+    brightness = region.mean(axis=2)
+
+    # Local paper brightness = the brighter half of the region.
+    upper = brightness[brightness > brightness.mean()]
+    bg_b = float(upper.mean()) if upper.size else float(brightness.mean())
+
+    # Ink threshold: below paper but high enough to catch faint anti-aliased
+    # stroke edges.  Capped at 175 — inside text regions the lightest watermark
+    # pixels stay above ~180, so the tint survives while the ink is fully caught.
+    thresh = min(bg_b * 0.68, 175.0)
+    ink = brightness < thresh
+    mask[y1:y2, x1:x2][ink] = 255
+
 
 def _is_over_graphic(
     arr: np.ndarray, x1: int, y1: int, x2: int, y2: int, img_h: int, img_w: int
@@ -223,13 +331,44 @@ def _fit_text(
     return font, _wrap_text(text, font, bbox_w)
 
 
-def _cluster_heights(heights: list) -> list:
+# A real heading is set in large type *and* carries enough text to justify it.
+# A stray OCR box that is tall but holds only a short token (e.g. an isolated
+# course code) is not a heading — clamping it prevents oversized single words.
+_HEADING_MIN_CHARS = 10
+
+
+def _fit_paragraph(
+    text: str,
+    target_px: int,
+    width: int,
+    avail_h: int,
+    font_path: str,
+) -> tuple:
+    """
+    Wrap a paragraph within `width` at the largest size (≤ target_px) whose
+    reflowed height fits `avail_h`, so a longer translation never overruns the
+    block that follows it.  Returns (font, wrapped_lines, line_pitch).
+    """
+    for scale in (1.0, 0.92, 0.85, 0.78, 0.7, 0.62, 0.55, 0.48, 0.4):
+        size = max(6, int(target_px * scale))
+        font = _load_font(font_path, size)
+        wrapped = _wrap_text(text, font, width)
+        pitch = max(1, int(_line_height(font) * 1.30))
+        if len(wrapped) * pitch <= avail_h or size <= 6:
+            return font, wrapped, pitch
+    font = _load_font(font_path, 6)
+    return font, _wrap_text(text, font, width), max(1, int(_line_height(font) * 1.30))
+
+
+def _cluster_heights(heights: list, texts: list = None) -> list:
     """
     Normalise char heights so table rows render at a consistent font size.
 
     All lines within ±35 % of the page-median height are "body text" and
     are set to a shared body median.  Heading/title lines (well above the
-    median) keep their individual sizes.
+    median) keep their individual sizes — but only if their text is long
+    enough to be a genuine heading; a tall box holding a short token is an
+    OCR artefact and is pulled back to the body size.
     """
     if not heights:
         return heights
@@ -241,10 +380,17 @@ def _cluster_heights(heights: list) -> list:
         i for i, h in enumerate(heights)
         if med > 0 and abs(h - med) / med <= 0.35
     ]
+    body_med = med
     if len(body_indices) >= 2:
         body_med = statistics.median(heights[i] for i in body_indices)
         for i in body_indices:
             result[i] = body_med
+
+    # Clamp tall outliers whose text is too short to be a real heading.
+    if texts is not None:
+        for i, h in enumerate(heights):
+            if h > body_med * 1.35 and len(texts[i].strip()) < _HEADING_MIN_CHARS:
+                result[i] = body_med
 
     return result
 
@@ -266,16 +412,26 @@ def _is_bold(
     arr: np.ndarray, x1: int, y1: int, x2: int, y2: int, bg_brightness: float
 ) -> bool:
     """
-    True when ink density is high relative to the page background.
-    Adaptive threshold: 55 % of background brightness.
+    True when the text strokes are thick (bold).
+
+    Measures stroke thickness by how many ink pixels survive a 1px erosion:
+    bold strokes keep most of their pixels, thin strokes lose most.  This is a
+    ratio within the same region, so it is unaffected by how tightly OCR
+    cropped the box (which made the old ink-density test misfire on isolated
+    tokens).
     """
     region = arr[y1:y2, x1:x2]
     if region.size == 0:
         return False
-    brightness    = region.mean(axis=2)
-    ink_threshold = bg_brightness * 0.55
-    dark_ratio    = (brightness < ink_threshold).sum() / brightness.size
-    return dark_ratio > _BOLD_THRESHOLD
+    ink = (region.mean(axis=2) < bg_brightness * 0.6).astype(np.uint8)
+    if int(ink.sum()) < 10:
+        return False
+    # Distance transform peaks at ~half the stroke width along each stroke's
+    # centre line; average over ink pixels and double to get the mean stroke
+    # width, then normalise by text height so the measure is scale-invariant.
+    dt = cv2.distanceTransform(ink, cv2.DIST_L2, 3)
+    stroke_width = 2.0 * float(dt[ink > 0].mean())
+    return (stroke_width / max(1, y2 - y1)) > _BOLD_THRESHOLD
 
 
 def _load_font(path: str, size: int) -> ImageFont.FreeTypeFont:

@@ -2,6 +2,7 @@ import json
 import os
 import queue
 import shutil
+import statistics
 import threading
 import uuid
 from pathlib import Path
@@ -146,7 +147,12 @@ def run_translation(job_id: str, input_path: str, target_language: str, dpi: int
                  page=n, total=total)
             image    = Image.open(page["image_path"]).convert("RGB")
             bg_color = eraser.sample_background(image)
-            image    = text_renderer.overlay_lines(image, lines, bg_color)
+
+            # Erase leftover English OCR could not read; detected numbers/codes stay.
+            ocr_boxes     = [[w["x1"], w["y1"], w["x2"], w["y2"]] for w in words]
+            median_line_h = statistics.median([w["y2"] - w["y1"] for w in words])
+            missed        = eraser.find_missed_text_boxes(image, ocr_boxes, median_line_h)
+            image    = text_renderer.overlay_lines(image, lines, bg_color, extra_erase_boxes=missed)
 
             out_path = page["image_path"].replace(".png", "_translated.png")
             image.save(out_path)
