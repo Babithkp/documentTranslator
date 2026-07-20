@@ -12,10 +12,21 @@ Per-line:
 """
 
 import bisect
+import re
 import statistics
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+# A bullet/list marker OCR left at the start of a line — a bullet glyph, or a
+# lone "-", "*", ".", or "o" (how OCR commonly renders "•") followed by a space.
+# The original "•" is destroyed inconsistently by OCR, so these artefacts read
+# as stray periods; they are stripped for a clean, uniform list.
+_LEADING_BULLET_RE = re.compile(r'^\s*(?:[•·▪◦‣●○∙]|[-*.oO])\s+')
+
+
+def _strip_leading_bullet(text: str) -> str:
+    return _LEADING_BULLET_RE.sub("", text, count=1)
 
 _MIMG = Image.new("RGB", (1, 1))
 _MDRAW = ImageDraw.Draw(_MIMG)
@@ -107,7 +118,7 @@ class TextRenderer:
         # First pass: mask original ink and record where to draw each translation.
         draw_jobs = []
         for line in lines:
-            text = line.get("translated", "").strip()
+            text = _strip_leading_bullet(line.get("translated", "").strip())
             if not text or not line.get("text_bbox"):
                 continue
 
@@ -133,13 +144,19 @@ class TextRenderer:
             # ── Mask original ink pixels for inpainting ──────────────────
             _mask_ink(ink_mask, orig_arr, x1, y1, x2, y2)
 
+            # Vertical room down to the next block below.  Both a reflowed
+            # paragraph and a single line whose (longer) translation must wrap
+            # use this so they grow downward into the empty space instead of
+            # shrinking to fit one row — bounded so they never overrun the
+            # following block.
+            nxt = bisect.bisect_right(entry_tops, y1)
+            slot_bottom = entry_tops[nxt] if nxt < len(entry_tops) else img_h
+            avail_h = max(bbox_h, slot_bottom - y1 - 2)
+
             if line.get("reflow"):
                 # Paragraph: re-wrap the whole block within its own width at a
                 # uniform size, shrinking only if the (longer) translation would
                 # run past the next block below.
-                nxt = bisect.bisect_right(entry_tops, y1)
-                slot_bottom = entry_tops[nxt] if nxt < len(entry_tops) else img_h
-                avail_h = max(bbox_h, slot_bottom - y1 - 2)
                 font, wrapped, pitch = _fit_paragraph(
                     text, target_px, bbox_w, avail_h, font_path
                 )
@@ -149,11 +166,16 @@ class TextRenderer:
                 })
                 continue
 
-            # ── Fit line: wrap within bbox width (bounded tolerance), scale
-            #    down only if too tall.  Tolerance keeps row sizes even. ──
+            # ── Fit line: wrap within bbox width (bounded tolerance), keep the
+            #    font size and let it flow down into the slot below; shrink only
+            #    when even that space is exhausted.  Capped so a line above a
+            #    large gap does not balloon into many full-size rows. ──
             fit_w = min(int(bbox_w * _WIDTH_TOLERANCE), img_w - x1 - 2)
             fit_w = max(fit_w, bbox_w)
-            font, wrapped = _fit_text(text, target_px, fit_w, bbox_h, font_path)
+            # Floor keeps the old single-row descender slack when the next line
+            # sits right below; cap stops a line above a big gap from filling it.
+            line_avail = min(max(avail_h, int(bbox_h * 1.3)), bbox_h * 5)
+            font, wrapped = _fit_text(text, target_px, fit_w, line_avail, font_path)
             line_h = _line_height(font)
             gap    = max(1, int(line_h * 0.15))
             block_h = len(wrapped) * line_h + (len(wrapped) - 1) * gap
@@ -306,15 +328,17 @@ def _fit_text(
     text: str,
     target_px: int,
     bbox_w: int,
-    bbox_h: int,
+    avail_h: int,
     font_path: str,
 ) -> tuple:
     """
-    Return (font, wrapped_lines) that fit within bbox_w × bbox_h.
+    Return (font, wrapped_lines) that fit within bbox_w × avail_h.
 
     Strategy: wrap at bbox_w first (no horizontal overflow ever), then
-    reduce font size in steps until the wrapped block fits vertically.
-    Falls back to the smallest readable size if nothing fits.
+    reduce font size in steps until the wrapped block fits vertically within
+    avail_h — the room down to the next block, so a longer translation wraps
+    onto extra lines at full size rather than shrinking.  Falls back to the
+    smallest readable size if nothing fits.
     """
     for scale in (1.0, 0.90, 0.80, 0.70, 0.60, 0.50, 0.40):
         size = max(6, int(target_px * scale))
@@ -325,7 +349,7 @@ def _fit_text(
         lh = _line_height(font)
         gap = max(1, int(lh * 0.15))
         total_h = len(wrapped) * lh + (len(wrapped) - 1) * gap
-        if total_h <= bbox_h * 1.3:   # allow 30 % height overflow before shrinking more
+        if total_h <= avail_h:
             return font, wrapped
     font = _load_font(font_path, 6)
     return font, _wrap_text(text, font, bbox_w)

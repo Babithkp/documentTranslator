@@ -81,6 +81,16 @@ def build_lines(words: list) -> list:
 _PARA_FILL_RATIO = 0.80    # a line reaching this fraction of the width is "full"
 _PARA_GAP_RATIO = 0.8      # max vertical gap (× line height) within a paragraph
 
+# A bullet/list marker at the very start of a line: a bullet glyph, or a lone
+# "-", "*", ".", or "o" (how OCR commonly renders "•") followed by a space and
+# more text.  Flowing prose never begins a line this way, so a line matching
+# this is an independent list item and must not be glued into a paragraph.
+_BULLET_RE = re.compile(r'^\s*(?:[•·▪◦‣●○∙]|[-*.oO])(?=\s+\S)')
+
+
+def _is_bullet_line(text: str) -> bool:
+    return bool(_BULLET_RE.match(text or ""))
+
 
 def _assemble_paragraphs(line_segments: list, page_right: float) -> list:
     """Merge consecutive prose lines into reflowable paragraph blocks."""
@@ -102,6 +112,14 @@ def _assemble_paragraphs(line_segments: list, page_right: float) -> list:
         while j < n and len(line_segments[j]) == 1:
             prev, cur = para[-1], line_segments[j][0]
             if not _is_full_width(prev, page_right):
+                break
+            # Never merge across a list boundary.  A bullet-marked line starts a
+            # fresh item; and once any line already in the run is a bullet, the
+            # run is a list, so a sibling whose marker OCR dropped must not be
+            # glued on either.  Each list item is then reflowed on its own.
+            if _is_bullet_line(cur["text"]) or any(
+                _is_bullet_line(p["text"]) for p in para
+            ):
                 break
             ph = prev["char_height"] or 1
             gap = cur["text_bbox"][1] - prev["text_bbox"][3]

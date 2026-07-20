@@ -21,7 +21,11 @@ Rules:
 2. Each element must be: {{"id": <int>, "translated": "<string>"}}
 3. Fix obvious OCR artefacts (merged words, character substitutions)
 4. Preserve codes, numbers, proper nouns, and formatting exactly
-5. Every id from the input must appear in the output"""
+5. Every id from the input must appear in the output
+6. Keep each translation close in length to its source. Translate terse
+   phrases and sign-offs directly — do NOT expand them into longer, more
+   formal equivalents (e.g. "Yours faithfully," must stay a short sign-off,
+   not become a full formal closing sentence)."""
 
         response = self.client.responses.create(
             model="gpt-4.1-mini",

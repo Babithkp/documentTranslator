@@ -20,10 +20,28 @@ class OCRProcessor:
 
     def extract(self, image_path: str) -> list:
         image = Image.open(image_path).convert("RGB")
+
+        # Pass 1: the untouched original.  Already-legible text is read here at
+        # full confidence and treated as authoritative.
+        base = self._detect(image)
+
+        # Pass 2 (optional): a contrast-boosted copy recovers faint / low-ink
+        # text (light italics, worn scans) the detector skips on the original.
+        # The boost can, however, blow a normal line into garbage, so its
+        # detections are only ADDED where pass 1 found nothing — never allowed
+        # to replace a clean read.  This keeps the recall gain without the
+        # corruption a single boosted pass caused.
         if self.contrast and self.contrast != 1.0:
-            image = ImageEnhance.Contrast(image).enhance(self.contrast)
-        # PaddleOCR expects BGR; contrast does not change geometry, so the
-        # returned bboxes still map onto the original image.
+            boosted = self._detect(ImageEnhance.Contrast(image).enhance(self.contrast))
+            for d in boosted:
+                if not any(_boxes_overlap(b, d) for b in base):
+                    base.append(d)
+
+        return base
+
+    def _detect(self, image: Image.Image) -> list:
+        # PaddleOCR expects BGR; the contrast boost does not change geometry, so
+        # the returned bboxes still map onto the original image either way.
         arr = np.array(image)[:, :, ::-1]
         result = self.ocr.ocr(arr, cls=True)
 
@@ -57,6 +75,22 @@ class OCRProcessor:
             })
 
         return words
+
+
+def _boxes_overlap(a: dict, b: dict, min_ratio: float = 0.3) -> bool:
+    """True when box b overlaps box a by more than min_ratio of b's own area.
+
+    Used to tell whether a contrast-boosted detection sits on top of a region
+    the original pass already read (keep the original) or in empty space
+    (recovered faint text worth adding).
+    """
+    ix = min(a["x2"], b["x2"]) - max(a["x1"], b["x1"])
+    iy = min(a["y2"], b["y2"]) - max(a["y1"], b["y1"])
+    if ix <= 0 or iy <= 0:
+        return False
+    inter = ix * iy
+    area_b = max(1.0, (b["x2"] - b["x1"]) * (b["y2"] - b["y1"]))
+    return inter / area_b > min_ratio
 
 
 def _looks_like_noise(text: str, conf: float) -> bool:
